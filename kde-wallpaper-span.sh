@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-
+#
+# kde-wallpaper-slice.sh — Robust JSON-based slicer for KDE (Wayland/X11).
+# Usage: ./kde-wallpaper-slice.sh /path/to/wallpaper.png [stretch|fit|fill] [--auto-apply]
+# Saves one cropped image per active monitor next to the script.
 set -euo pipefail
 
 # Default scaling mode: fill (scales to cover entire screen, crops excess)
@@ -256,34 +259,94 @@ if (( errors == 0 )); then
     echo
     echo "🖼️  Auto-applying wallpapers to screens..."
     
-    # Reverse the OUTPUT_FILES array to match correct desktop order
-    declare -a REVERSED_FILES=()
-    for ((i=${#OUTPUT_FILES[@]}-1; i>=0; i--)); do
-      REVERSED_FILES+=("${OUTPUT_FILES[$i]}")
-    done
+    # Get the actual desktop-to-screen mapping from KDE
+    echo "   Detecting desktop-to-screen mapping..."
+    desktop_mapping=$(qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+      var allDesktops = desktops();
+      var result = [];
+      for (var i = 0; i < allDesktops.length; i++) {
+        result.push(allDesktops[i].screen);
+      }
+      result.join(',');
+    " 2>/dev/null)
     
-    # Apply each wallpaper sequentially from reversed array
-    idx=0
-    for entry in "${REVERSED_FILES[@]}"; do
-      IFS='|' read -r screen_name wallpaper_file <<< "$entry"
+    IFS=',' read -ra DESKTOP_TO_SCREEN <<< "$desktop_mapping"
+    
+    if [[ ${#DESKTOP_TO_SCREEN[@]} -eq 0 ]]; then
+      echo "   ⚠️  Could not detect desktop mapping, using direct order"
+      # Fallback to direct application
+      idx=0
+      for entry in "${OUTPUT_FILES[@]}"; do
+        IFS='|' read -r screen_name wallpaper_file <<< "$entry"
+        echo "   Applying to desktop $idx: $screen_name → $(basename "$wallpaper_file")"
+        
+        qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+          var allDesktops = desktops();
+          if (allDesktops.length > $idx) {
+            var d = allDesktops[$idx];
+            d.wallpaperPlugin = 'org.kde.image';
+            d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];
+            d.writeConfig('Image', 'file://$wallpaper_file');
+            d.writeConfig('FillMode', '2');
+          }
+        " >/dev/null 2>&1
+        idx=$((idx + 1))
+      done
+    else
+      echo "   Desktop mapping:"
+      for desk_idx in "${!DESKTOP_TO_SCREEN[@]}"; do
+        echo "     Desktop $desk_idx → Screen ${DESKTOP_TO_SCREEN[$desk_idx]}"
+      done
       
-      echo "   Applying wallpaper $((idx+1)): $screen_name → $(basename "$wallpaper_file")"
-      
-      # Apply wallpaper using direct JavaScript approach
-      qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
-        var allDesktops = desktops();
-        if (allDesktops.length > $idx) {
-          var d = allDesktops[$idx];
-          d.wallpaperPlugin = 'org.kde.image';
-          d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];
-          d.writeConfig('Image', 'file://$wallpaper_file');
-          d.writeConfig('FillMode', '2');
-          print('Applied to desktop ' + $idx);
-        }
-      " 2>&1 | grep -i "Applied" || echo "      (applied)"
-      
-      idx=$((idx + 1))
-    done
+      # Apply wallpapers by matching screen numbers
+      for entry in "${OUTPUT_FILES[@]}"; do
+        IFS='|' read -r screen_name wallpaper_file <<< "$entry"
+        
+        # Find which screen number this monitor corresponds to
+        # Match by position in the MONITORS array (screen 0 is first, screen 1 is second, etc.)
+        screen_num=-1
+        for i in "${!MONITORS[@]}"; do
+          IFS='|' read -r mon_name _ _ _ _ _ _ _ _ <<< "${MONITORS[$i]}"
+          if [[ "$mon_name" == "$screen_name" ]]; then
+            screen_num=$i
+            break
+          fi
+        done
+        
+        if [[ $screen_num -eq -1 ]]; then
+          echo "   ⚠️  Could not find screen number for $screen_name"
+          continue
+        fi
+        
+        # Find which desktop maps to this screen number
+        desktop_idx=-1
+        for desk in "${!DESKTOP_TO_SCREEN[@]}"; do
+          if [[ ${DESKTOP_TO_SCREEN[$desk]} -eq $screen_num ]]; then
+            desktop_idx=$desk
+            break
+          fi
+        done
+        
+        if [[ $desktop_idx -eq -1 ]]; then
+          echo "   ⚠️  Could not find desktop for screen $screen_num ($screen_name)"
+          continue
+        fi
+        
+        echo "   Applying to screen $screen_num ($screen_name) → $(basename "$wallpaper_file")"
+        
+        qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+          var allDesktops = desktops();
+          if (allDesktops.length > $desktop_idx) {
+            var d = allDesktops[$desktop_idx];
+            d.wallpaperPlugin = 'org.kde.image';
+            d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];
+            d.writeConfig('Image', 'file://$wallpaper_file');
+            d.writeConfig('FillMode', '2');
+            print('✓ Applied $screen_name to desktop $desktop_idx (screen $screen_num)');
+          }
+        " 2>&1 | grep "✓" || echo "      (applied)"
+      done
+    fi
     
     echo
     echo "✅ Wallpapers applied!"
@@ -302,3 +365,4 @@ else
   echo "⚠️  Completed with $errors error(s). Check output above." >&2
 fi
 echo "═══════════════════════════════════════════════════════"
+
